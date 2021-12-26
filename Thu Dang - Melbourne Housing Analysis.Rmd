@@ -1,0 +1,834 @@
+---
+title: "STAT 253 Final Project - Thu"
+author: "Thu Dang"
+date: "12/16/2021"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+# Project Work {-}
+
+## Data Preparation {-}
+
+```{r 02_setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = FALSE, message = FALSE, tidy = TRUE)
+```
+
+### Loading libraries {-}
+
+```{r}
+library(dplyr)
+library(readr)
+library(broom)
+library(ggplot2)
+library(tidymodels) 
+library(readxl)
+library(lubridate)
+library(ISLR)
+library(vip)
+library(cluster)
+library(rpart.plot) # install.packages('rpart.plot')
+
+tidymodels_prefer() # Resolves conflicts, prefers tidymodel functions
+```
+
+## 1. Regression {-}
+
+### *Research question: How do we predict the price of houses in Melbourne?*
+
+```{r}
+# Melbourne Housing Data
+
+melb <- read_excel("melb_data.xlsx")
+```
+
+### a. Data Exploration
+
+#### i. Data Cleaning: Remove NA values
+
+```{r}
+melbclean <- melb %>% select(-Longtitude, -Lattitude, -Address, -Postcode, -SellerG) %>%
+  mutate(Date = dmy(Date), logPrice = log(Price))
+
+sapply(melbclean, function(x) sum(is.na(x)))
+
+melbclean <- melbclean %>% na.omit()
+
+head(melbclean)
+```
+
+#### ii. Distribution of house prices
+
+```{r}
+# Exploratory plots
+# Right-skewed distribution
+
+ggplot(melbclean, aes(x = Price)) +
+    geom_histogram(fill= 'lightblue') +
+    theme_classic() +
+    labs(x = "Price of houses in Melbourne (Australian dollars)", y = 'Count')
+```
+
+The distribution of house prices in Melbourne is right-skewed. The majority of the prices lie between 0 and 1500000. 
+
+It is also very interesting to see how distance from Sydney Central Business District affects the price
+
+#### iii. Exploratory plots between House Price and Distance from Sydney Central Business District
+
+```{r}
+# Scatterplot of Price and Distance
+ggplot(melbclean, aes(x = Distance, y = Price)) +
+    geom_point(color = 'pink') +
+    geom_smooth() +
+    theme_classic() +
+    labs(x = "Distance from Sydney Central Business District (km)", y = "Price of houses in Melbourne (Australian dollars)")
+```
+
+```{r}
+melbclean <- melbclean %>% filter(Price < 6000000)
+```
+
+After removing the Price outliers:
+
+```{r}
+# Scatterplot of Price and Distance
+ggplot(melbclean, aes(x = Distance, y = Price)) +
+    geom_point(color = 'pink') +
+    geom_smooth() +
+    theme_classic() +
+    labs(x = "Distance from Sydney Central Business District (km)", y = "Price of houses in Melbourne (Australian dollars)")
+```
+
+
+```{r}
+# Scatterplot of Year and Type of Houses
+ggplot(melbclean, aes(x = Type, y = YearBuilt)) +
+    geom_boxplot(color = 'blue') +
+    geom_smooth() +
+    theme_classic() +
+    labs(x = "Type of Houses", y = "The Year the House is built")
+```
+
+
+```{r}
+melbclean <- melbclean %>% filter(YearBuilt > 1800)
+```
+
+
+After removing the YearBuilt outlier: 
+
+```{r}
+# Scatterplot of Year and Type of Houses
+ggplot(melbclean, aes(x = Type, y = YearBuilt)) +
+    geom_boxplot(color = 'blue') +
+    geom_smooth() +
+    theme_classic() +
+    labs(x = "Type of Houses", y = "The Year the House is built")
+```
+
+### b. Data Pre-processing for Modelling
+
+#### i. Create CV folds
+
+```{r}
+melbclean_cv <- vfold_cv(melbclean, v = 10)
+```
+
+### c. Simple linear regression - assuming linearity
+
+#### i. Model Specification
+
+```{r}
+lm_spec <-
+    linear_reg() %>% 
+    set_engine(engine = 'lm') %>% 
+    set_mode('regression')
+```
+
+#### ii. Recipe and Workflow
+
+```{r}
+full_rec <- recipe(logPrice ~ ., data = melbclean) %>%
+    step_rm(CouncilArea, Price, Regionname, Method, Suburb, Date) %>%
+    step_nzv(all_predictors()) %>% # removes variables with the same value
+    step_normalize(all_numeric_predictors()) %>% # important standardization step for LASSO
+    step_dummy(all_nominal_predictors())  
+
+melb_wf <- workflow() %>%
+  add_recipe(full_rec) %>%
+  add_model(lm_spec)
+```
+
+#### iii. Fit and Tune Models
+
+
+```{r}
+mod_initial <- fit(melb_wf, data = melbclean)
+
+mod1_cv <- fit_resamples(melb_wf,
+  resamples = melbclean_cv, 
+  metrics = metric_set(rmse, rsq, mae)
+)
+mod1_cv %>% collect_metrics()
+```
+
+
+### d. LASSO - selecting variables that matter
+
+#### i. Model specification, recipe, and workflow
+
+```{r}
+set.seed(244)
+
+lm_lasso_spec_tune <- 
+  linear_reg() %>%
+  set_args(mixture = 1, penalty = tune()) %>% 
+  set_engine(engine = 'glmnet') %>%
+  set_mode('regression') 
+
+lasso_wf <- workflow() %>% 
+  add_recipe(full_rec) %>%
+  add_model(lm_lasso_spec_tune) 
+
+penalty_grid <- grid_regular(
+  penalty(range = c(-5, 1)), 
+  levels = 30)
+
+lasso_fit_cv <- tune_grid( # new function for tuning hyperparameters
+  lasso_wf, # workflow
+  resamples = melbclean_cv, # folds
+  metrics = metric_set(rmse, mae, rsq),
+  grid = penalty_grid # penalty grid
+)
+```
+
+#### ii. Selecting the best metric using the *select_best* method
+
+```{r}
+lasso_fit_cv %>% select_best(metric = 'rmse') %>% arrange(desc(penalty))
+lasso_fit_cv %>% select_best(metric = 'rsq') %>% arrange(desc(penalty))
+```
+
+#### iii. Selecting the best metric using the *1 standard error* method
+
+```{r}
+lasso_fit_cv %>% 
+  select_by_one_std_err(metric = 'rmse', desc(penalty))
+lasso_fit_cv %>% 
+  select_by_one_std_err(metric = 'rsq', desc(penalty))
+```
+
+#### iv. Tuning the lasso model using the penalty with the best R-squared acquired from the *1 standard error* method 
+
+```{r}
+best_penalty <- lasso_fit_cv %>% 
+  select_by_one_std_err(metric = 'rmse', desc(penalty))
+
+tuned_lasso_wf <- finalize_workflow(lasso_wf, best_penalty)
+
+lm_lasso_spec <- tuned_lasso_wf %>% pull_workflow_spec() # Save final tuned model spec
+```
+
+#### v. Plotting the penalty for mae, rmse, and rsq
+
+```{r}
+lasso_fit_cv %>% autoplot() + theme_classic()
+```
+
+#### vi. List of variables by importance using the selected best penalty
+
+```{r}
+lasso_fit <- tuned_lasso_wf %>% 
+  fit(data = melbclean) 
+
+tidy(lasso_fit) %>% arrange(desc(abs(estimate)))
+```
+
+#### vii. Examining output: plot of coefficient paths
+
+```{r}
+glmnet_output <- lasso_fit %>% extract_fit_parsnip() %>% pluck('fit') # way to get the original glmnet output
+
+lambdas <- glmnet_output$lambda
+coefs_lambdas <- 
+  coefficients(glmnet_output, s = lambdas )  %>% 
+  as.matrix() %>%  
+  t() %>% 
+  as.data.frame() %>% 
+  mutate(lambda = lambdas ) %>% 
+  select(lambda, everything(), -`(Intercept)`) %>% 
+  pivot_longer(cols = -lambda, 
+               names_to = "term", 
+               values_to = "coef") %>%
+  mutate(var = map_chr(stringr::str_split(term,"_"),~.[1]))
+
+coefs_lambdas %>%
+  ggplot(aes(x = lambda, y = coef, group = term, color = var)) +
+  geom_line() +
+  geom_vline(xintercept = best_penalty %>% pull(penalty), linetype = 'dashed') + 
+  theme_classic() + 
+  theme(legend.position = "bottom", legend.text=element_text(size=8))
+```
+
+```{r}
+glmnet_output_1 <- lasso_fit %>% extract_fit_engine()
+    
+# Create a boolean matrix (predictors x lambdas) of variable exclusion
+bool_predictor_exclude <- glmnet_output_1$beta==0
+
+# Loop over each variable
+var_imp <- sapply(seq_len(nrow(bool_predictor_exclude)), function(row) {
+    this_coeff_path <- bool_predictor_exclude[row,]
+    if(sum(this_coeff_path) == ncol(bool_predictor_exclude)){ return(0)}else{
+    return(ncol(bool_predictor_exclude) - which.min(this_coeff_path) + 1)}
+})
+
+# Create a dataset of this information and sort
+var_imp_data <- tibble(
+    var_name = rownames(bool_predictor_exclude),
+    var_imp = var_imp
+)
+var_imp_data %>% arrange(desc(var_imp))
+```
+
+
+### e. Residual plots - checking residual pattern to decide whether to update the model
+
+```{r}
+mod1_output <- mod_initial%>% 
+    predict(new_data = melbclean) %>% #this function maintains the row order of the new_data
+    bind_cols(melbclean) %>%
+    mutate(resid = logPrice - .pred)
+
+mod1_output %>% filter(resid < -2.5)
+
+mod1_output <- mod1_output %>%
+  mutate(colors = if_else(.pred > 17.8,1,0))
+
+# Quick plot: Residuals vs. Fitted values
+ggplot(mod1_output, aes(x = .pred, y = resid)) +
+    geom_point() +
+    geom_smooth() +
+    geom_hline(yintercept = 0, color = "red") +
+    theme_classic() +
+    labs(x = "Fitted values", y = "Residuals")
+
+# Residuals vs. Distance predictor
+ggplot(mod1_output, aes(x= Distance, y = resid)) +
+    geom_point() +
+    geom_smooth() +
+    geom_hline(yintercept = 0, color = "red") +
+    theme_classic() +
+    labs(x = "Distance", y = "Residuals")
+
+# Residuals vs. Room predictor
+ggplot(mod1_output, aes(x= YearBuilt, y = resid)) +
+    geom_point() +
+    geom_smooth() +
+    geom_hline(yintercept = 0, color = "red") +
+    theme_classic() +
+    labs(x = "Year Built", y = "Residuals")
+```
+
+```{r}
+mod1_output %>% filter(.pred > 17)
+```
+
+
+### f. Updating the model for non-linearity
+
+
+#### Method 1: Spline
+
+
+```{r}
+set.seed(123)
+
+full_rec <- recipe(logPrice ~ ., data = melbclean) %>%
+    step_rm(CouncilArea,Price,Regionname,Method,Suburb,Date) %>%
+    step_nzv(all_predictors()) %>% # removes variables with the same value
+    step_normalize(all_numeric_predictors()) %>% # important standardization step for LASSO
+    step_dummy(all_nominal_predictors())  %>%
+    step_ns(Distance, deg_free = 5) %>%
+    step_ns(Bathroom, deg_free = 5)
+
+
+# Workflow (Recipe + Model)
+spline_wf <- workflow() %>% 
+  add_recipe(full_rec) %>%
+  add_model(lm_spec) 
+
+
+# CV to Evaluate
+cv_output <- fit_resamples(
+ spline_wf,
+ resamples = melbclean_cv, # cv folds
+ metrics = metric_set(mae,rsq,rmse)
+)
+
+cv_output %>% collect_metrics()
+
+# Fit model
+ns_mod <- spline_wf %>%
+  fit(data = melbclean) 
+
+ns_mod %>%
+  tidy()
+
+spline_mod_output <- melbclean %>%
+  bind_cols(predict(ns_mod, new_data = melbclean)) %>%
+    mutate(resid = logPrice - .pred)
+
+ ggplot(spline_mod_output, aes(x = logPrice, y = resid)) +
+    geom_point() +
+    geom_smooth() +
+    geom_hline(yintercept = 0, color = "red") +
+    theme_classic()
+```
+
+```{r}
+ns_mod %>%
+  tidy() %>% 
+  mutate(absolute_estimate_spline = abs(estimate)) %>% 
+  arrange(desc(absolute_estimate_spline))
+```
+
+
+#### Method 2: GAM
+
+
+```{r}
+set.seed(123)
+# Generalized Additive Regression (GAM) Model
+gam_spec <- 
+  gen_additive_mod() %>%
+  set_engine(engine = 'mgcv') %>%
+  set_mode('regression') 
+```
+
+```{r}
+fit_gam_model <- gam_spec %>% # can't use a recipe with gam (yet)
+  fit(Price ~ Type + s(Distance, k = 5) + s(Rooms, k = 5) + s(YearBuilt, k = 5) + s(Bathroom, k = 5), data = melbclean) # s() stands for splines  
+```
+
+```{r}
+fit_gam_model %>% pluck('fit') %>% summary() # estimates generalized CV error to choose smoothness, if not specified
+```
+
+Based on the output, it looks like Type u (unit, duplex) and Type t (townhouse) have on average a price that is lower by 167K and 213K respectively compared to Type h (house, cottage, villa, semi, terrace), keeping all other factors fixed.
+
+Based on the smooth terms, Distance, Rooms, YearBuilt, Bathroom seem to be strong predictors after considering other variables in the model. They seem to be wiggly curves with edf ranging from 3 to 4. 
+
+
+```{r}
+# Diagnostics: Check to see if the number of knots is large enough (if p-value is low, increase number of knots)
+par(mfrow=c(2,2))
+fit_gam_model %>% pluck('fit') %>% mgcv::gam.check() 
+
+
+```
+
+The residual plots look fine. There are no extreme patterns in the Q-Q plot (they are close to the line, which suggests the residuals are approximately Normal). There is no obvious pattern in the residual vs. linear pred. plot. The histogram of the residuals is unimodal and right-skewed. Lastly, the response v. fitted values are positively correlated as they should be. 
+
+For the number of knots, we see the edf (effective degree of freedom) is much lower than the k' = k - 1 and all of the p-values are quite large. This indicates that there are enough knots for the wiggliness of the relationships. 
+
+```{r}
+fit_gam_model %>% pluck('fit') %>% plot(pages = 1)
+```
+
+The relationships between Melbourne house price and the predictors look to be at least slightly nonlinear for the chosen predictors. This suggests that forcing linear relationships would not have been ideal.
+
+
+## 2. Classification {-}
+
+### *Research question: How do we predict which type of house it is (house, unit, townhouse) based on the exisiting predictors?*
+
+### a. Data Exploration
+
+#### i. Distribution of type of houses in terms of prices and building area
+
+```{r}
+# Exploratory plots
+
+ggplot(melbclean, aes(x = BuildingArea, y = logPrice, color = Type)) +
+    geom_point() + 
+    theme_classic() +
+    labs(color = 'Type of Houses')
+```
+
+#### ii. Data Cleaning: Removing outliers and change Type to factor
+
+```{r}
+# Remove outliers: Building Area that are greater than 1500
+
+melbclean_classification <- melbclean %>% filter(BuildingArea < 1500)
+
+# Change Type to factor
+melbclean_classification <- melbclean_classification %>%
+  mutate(Type = factor(Type)) %>% #make sure outcome is factor
+  mutate(across(where(is.character), as.factor)) #change all character variables to factors
+
+unique(melbclean_classification$Type)
+```
+
+#### iii. More exploratory plots
+
+```{r}
+# Exploratory plots
+
+ggplot(melbclean_classification, aes(x = BuildingArea, y = logPrice, color = Type)) +
+    geom_point() + 
+    theme_classic() +
+    labs(color = 'Type of Houses')
+```
+
+```{r}
+ggplot(melbclean_classification, aes(x = Type, y = logPrice)) +
+  geom_boxplot() + 
+    labs(x = "House Type", y = "Log of House Price") +
+    scale_fill_viridis_d() +
+    theme_classic() +
+    theme(text = element_text(size = 20))
+```
+
+```{r}
+ggplot(melbclean_classification, aes(x = Type, y = Distance)) +
+  geom_boxplot() + 
+    labs(x = "House Type", y = "Distance") +
+    scale_fill_viridis_d() +
+    labs(x = 'House Type', y = 'Distance from Sydney Central Business District (km)') +
+    theme_classic() +
+    theme(text = element_text(size = 20)) 
+```
+
+```{r}
+ggplot(melbclean_classification, aes(x = Type, y = Landsize)) +
+  geom_boxplot() + 
+    labs(x = "House Type", y = "Landsize") +
+    scale_fill_viridis_d() +
+    theme_classic() +
+    theme(text = element_text(size = 20))
+```
+
+#### iv. No Information Rate
+
+```{r}
+melbclean_classification %>% group_by(Type) %>% summarize(count = n())
+```
+
+
+
+### b. Modelling: Decision Tree
+
+#### i. Model Specification
+
+```{r}
+ct_spec <- decision_tree() %>%
+  set_engine(engine = 'rpart') %>%
+  set_args(cost_complexity = NULL,  #default is 0.01 (used for pruning a tree)
+           min_n = NULL, #min number of observations to try split: default is 20 [I think the documentation has a typo and says 2]  (used to stop early)
+           tree_depth = NULL) %>% #max depth (max number of splits to get to any final group: default is 30 (used to stop early)
+  set_mode('classification') # change this for regression tree
+```
+
+#### ii. Recipe and Workflow
+
+```{r}
+type_predict <- recipe(Type ~ ., data = melbclean_classification) %>%
+  #step_unknown(all_nominal_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+type_wf <- workflow() %>%
+  add_model(ct_spec) %>%
+  add_recipe(type_predict)
+```
+
+#### iii. Model Building
+
+```{r}
+fit_type <- type_wf %>%
+  fit(data = melbclean_classification)
+
+# Default tuning parameters (min_n = 20, depth = 30, cost_complexity = 0.01)
+fit_type %>%
+  extract_fit_engine() %>%
+  rpart.plot()
+```
+
+#### iv. Visualizing metrics
+
+```{r}
+type_output <-  bind_rows(
+  predict(fit_type, new_data = melbclean_classification) %>% bind_cols(melbclean_classification %>% select(Type)) %>% mutate(model = 'orig'))
+
+ct_metrics <- metric_set(sens, yardstick::spec, accuracy)
+
+# No Information Rate (accuracy if you classified everyone using largest outcome group): Proportion of largest outcome group
+melbclean_classification %>%
+  count(Type) %>%
+  mutate(prop = n/sum(n)) %>%
+  filter(prop == max(prop))
+
+# Training Data Metrics
+metrics <- type_output %>% 
+  group_by(model) %>%
+  ct_metrics(estimate = .pred_class, truth = Type) 
+
+
+metrics %>% filter(.metric == 'accuracy') %>% arrange(desc(.estimate))
+metrics %>% filter(.metric == 'sens') %>% arrange(desc(.estimate))
+metrics %>% filter(.metric == 'spec') %>% arrange(desc(.estimate))
+
+metrics %>%
+  ggplot(aes(x = .metric, y = .estimate, color = model)) +
+  geom_point(size = 2) +
+  geom_line(aes(group = model)) +
+  theme_classic()
+```
+
+### c. Modelling: Random Forest
+
+#### i. Model Specification
+
+```{r}
+set.seed(123)
+rf_spec <- rand_forest() %>%
+  set_engine(engine = 'ranger') %>% 
+  set_args(mtry = NULL, 
+           trees = 1000, 
+           min_n = 2,
+           probability = FALSE, 
+           importance = 'impurity') %>% 
+  set_mode('classification') 
+```
+
+#### ii. Recipe and Workflow
+
+```{r}
+# Recipe
+data_rec <- recipe(Type ~ ., data = melbclean_classification) %>% step_rm(Price)
+
+# Workflows
+data_wf <- workflow() %>%
+  add_model(rf_spec ) %>%
+  add_recipe(data_rec)
+```
+
+#### iii. Model Building
+
+##### a. Evaluating OOB metrics
+
+```{r}
+data_fit <- fit(data_wf, data = melbclean_classification)
+
+rf_OOB_output <- function(fit_model, model_label, truth){
+    tibble(
+          .pred_class = fit_model %>% extract_fit_engine() %>% pluck('predictions'), #OOB predictions
+          class = truth,
+          model = model_label
+      )
+}
+
+data_rf_OOB_output <- bind_rows(
+    rf_OOB_output(data_fit,2, melbclean_classification %>% pull(Type))
+)
+```
+
+##### b. Fitting data
+```{r}
+data_fit
+```
+
+##### c. Assessing variable importance
+
+```{r}
+model_output <-
+  data_fit %>% 
+    extract_fit_engine() 
+
+model_output %>% 
+    vip(num_features = 10) + theme_classic() #based on impurity
+
+model_output %>% vip::vi() %>% head()
+model_output %>% vip::vi() %>% tail()
+```
+
+
+
+## 3. Clustering {-}
+
+### *Research question: How many different clusters/types of houses in Melbourne based on the existing predictors?*
+
+### a. Data Exploration
+
+#### i. Distribution of Melbourne houses based on Distance and Building Area
+
+```{r}
+ggplot(melbclean, aes(x = Distance, y = BuildingArea)) +
+    geom_point(color = 'lightblue') +
+    theme_classic() + 
+    labs (x = 'Building Area', y = 'Distance from Sydney Central Business District (km)')
+```
+
+### b. Picking the number of clusters: The Elbow Method
+
+```{r}
+melbclean_clustering <- melbclean %>% 
+  mutate(across(where(is.character), as.factor)) 
+
+melbclean_clustering_kmeans <- melbclean_clustering %>% # Change all character variables to factors
+  select(Rooms, YearBuilt, Distance, BuildingArea) # Select a subset of variables to perform k-means
+
+# Data-specific function to cluster and calculate total within-cluster SS
+
+house_cluster_ss <- function(k){
+    # Perform clustering
+    kclust <- kmeans(daisy(melbclean_clustering_kmeans), centers = k)
+
+    # Return the total within-cluster sum of squares
+    return(kclust$tot.withinss)
+}
+
+tibble(
+    k = 1:15,
+    tot_wc_ss = purrr::map_dbl(1:15, house_cluster_ss)
+) %>% 
+    ggplot(aes(x = k, y = tot_wc_ss)) +
+    geom_point() + 
+    labs(x = "Number of clusters", y = 'Total within-cluster sum of squares') + 
+    theme_classic()
+
+```
+
+Test with 3 and 5. 
+
+### c. Modelling: K-means Clustering
+
+#### i. Create model with k = 3
+
+```{r}
+# Run k-means for k = centers = 3
+set.seed(253)
+kclust_k3_scale <- kmeans(daisy(melbclean_clustering_kmeans), centers = 3)
+melbclean_clustering <- melbclean_clustering %>%
+    mutate(kclust_3_scale = factor(kclust_k3_scale$cluster))
+```
+
+
+```{r}
+# Visualize the cluster assignments with Distance and Building Area
+ggplot(melbclean_clustering, aes(x = Distance, y = BuildingArea, color = kclust_3_scale)) +
+    geom_point() + 
+    labs (x = 'Distance from Sydney Central Business District (km)', y = 'Building Area') +
+    theme_classic()
+```
+
+
+```{r}
+# Visualize the cluster assignments with Year Built and Building Area
+ggplot(melbclean_clustering, aes(x = YearBuilt, y = BuildingArea, color = kclust_3_scale)) +
+    geom_point() + 
+    labs (x = 'Year Built', y = 'Building Area') +
+    theme_classic()
+```
+
+
+```{r}
+# Visualize the cluster assignments with Type and Distance
+ggplot(melbclean_clustering, aes(x = Type, y = Distance, color = kclust_3_scale)) +
+    geom_boxplot() + 
+    labs (x = 'Type of Houses', y = 'Distance from Sydney Central Business District (km)') +
+    theme_classic()
+```
+
+
+#### ii. Create model with k = 5
+
+
+```{r}
+# Run k-means for k = centers = 5
+set.seed(253)
+kclust_k5_scale <- kmeans(daisy(melbclean_clustering_kmeans), centers = 5)
+melbclean_clustering <- melbclean_clustering %>%
+    mutate(kclust_5_scale = factor(kclust_k5_scale$cluster))
+```
+
+```{r}
+# Visualize the cluster assignments with Distance and Building Area
+ggplot(melbclean_clustering, aes(x = Distance, y = BuildingArea, color = kclust_5_scale)) +
+    geom_point() + 
+    labs (x = 'Distance from Sydney Central Business District (km)', y = 'Building Area') +
+    theme_classic()
+```
+
+```{r}
+# Visualize the cluster assignments with Year Built and Building Area
+ggplot(melbclean_clustering, aes(x = YearBuilt, y = BuildingArea, color = kclust_5_scale)) +
+    geom_point() + 
+    labs (x = 'Year Built', y = 'Building Area') +
+    theme_classic()
+```
+
+
+```{r}
+# Visualize the cluster assignments with Type and Distance
+ggplot(melbclean_clustering, aes(x = Type, y = Distance, color = kclust_5_scale)) +
+    geom_boxplot() + 
+    labs (x = 'Type of Houses', y = 'Distance from Sydney Central Business District (km)') +
+    theme_classic()
+```
+
+### d. Modelling - Hierarchical Clustering
+
+```{r}
+set.seed(253)
+
+melbclean_clustering_1 <- melbclean %>% 
+  mutate(across(where(is.character), as.factor)) %>% # Change all character variables to factors
+  select(-Date) # Remove the Date variable
+
+
+house_sub <- melbclean_clustering_1 %>%
+  sample_n(50)
+dist_mat_scaled <- dist(daisy(house_sub))
+house_cluster <- hclust(dist_mat_scaled, method = "complete")
+
+plot(house_cluster)
+
+melbclust <- house_sub %>%
+  mutate(
+    hclust_area3 = factor(cutree(house_cluster, h = 3)),
+    hclust4 = cutree(house_cluster,k = 4))
+```
+
+```{r}
+ggplot(melbclust, aes(x= factor(hclust4), y = Distance))+
+  geom_boxplot()+
+  labs(x = "Cluster")+
+  theme_classic()
+```
+
+```{r}
+ggplot(melbclust, aes(x= factor(hclust4), y = Landsize))+
+  geom_boxplot()+
+  labs(x = "Cluster")+
+  theme_classic()
+```
+
+```{r}
+ggplot(melbclust, aes(x = factor(hclust4), fill = factor(Rooms)))+
+  geom_bar(position = "fill") +
+    labs(x = "Cluster") + 
+    theme_classic()
+```
+
+```{r}
+ggplot(melbclust, aes(x = factor(hclust4), fill = factor(Type)))+
+  geom_bar(position = "fill") +
+    labs(x = "Cluster") + 
+    theme_classic()
+```
+
